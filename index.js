@@ -1,44 +1,66 @@
-// =========================
-//      KNIGHT BOT v2
-//     (Email First Auth)
-// =========================
+require('dotenv').config()
 
-require('./settings')
+// ------------------ Imports ------------------
 const fs = require('fs')
 const axios = require('axios')
-const { createClient } = require('@supabase/supabase-js')
-const OpenAI = require('openai')
 const dayjs = require('dayjs')
+const OpenAI = require('openai')
 const NodeCache = require('node-cache')
 const pino = require('pino')
-const store = require('./lib/lightweight_store')
+const { createClient } = require('@supabase/supabase-js')
 const { smsg } = require('./lib/myfunc')
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys')
+const store = require('./lib/lightweight_store')
 
-// -------------------- ENV --------------------
-const SUPABASE_URL = process.env.SUPABASE_URL
-const SUPABASE_KEY = process.env.SUPABASE_KEY
-const OPENAI_KEY = process.env.OPENAI_KEY
-const WEBSITE_URL = process.env.WEBSITE_URL
+const { 
+    default: makeWASocket,
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore
+} = require('@whiskeysockets/baileys')
 
-if (!SUPABASE_URL || !SUPABASE_KEY || !OPENAI_KEY || !WEBSITE_URL) {
-    console.error("❌ Missing one or more environment variables!")
-    process.exit(1)
+// Load store
+store.readFromFile()
+setInterval(() => store.writeToFile(), 10000)
+
+// ------------------ ENV Check ------------------
+const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_KEY', 'OPENAI_KEY', 'WEBSITE_URL']
+REQUIRED_ENV.forEach(key => {
+    if (!process.env[key]) {
+        console.error(`❌ Missing environment variable: ${key}`)
+        process.exit(1)
+    }
+})
+
+// ------------------ Services ------------------
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
+const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY })
+let websiteCache = ""
+
+
+// ------------------ Load website once ------------------
+async function preloadWebsite() {
+    try {
+        websiteCache = (await axios.get(process.env.WEBSITE_URL)).data
+        console.log("🌐 Website cached successfully.")
+    } catch (err) {
+        console.log("⚠ Failed to load website:", err.message)
+    }
+}
+preloadWebsite()
+setInterval(preloadWebsite, 1000 * 60 * 5) // refresh every 5 minutes
+
+
+// ------------------ WhatsApp Helper ------------------
+async function sendWhatsApp(bot, to, body) {
+    try {
+        await bot.sendMessage(to, { text: body })
+    } catch (err) {
+        console.log("Send error:", err.message)
+    }
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
-const openai = new OpenAI({ apiKey: OPENAI_KEY })
 
-// ---------------- WHATSAPP SENDER ----------------
-async function sendWhatsApp(bot, to, text) {
-    try { await bot.sendMessage(to, { text }) }
-    catch (err) { console.log("Send error:", err.message) }
-}
-
-// This cache stores: { phoneNumber: email }
-const emailSession = new NodeCache({ stdTTL: 600 }) // 10 minutes
-
-// ---------------- MAIN BOT ----------------
+// ------------------ START KNIGHT BOT ------------------
 async function startKnightBot() {
     try {
         const { version } = await fetchLatestBaileysVersion()
@@ -51,256 +73,157 @@ async function startKnightBot() {
             printQRInTerminal: true,
             auth: {
                 creds: state.creds,
-                keys: makeCacheableSignalKeyStore(
-                    state.keys,
-                    pino({ level: 'error' }).child({ level: 'fatal' })
-                )
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' }))
             },
-            msgRetryCounterCache,
-            keepAliveIntervalMs: 10000
+            msgRetryCounterCache
         })
 
         store.bind(bot)
         bot.ev.on('creds.update', saveCreds)
 
-        // ---------------- MESSAGE HANDLER ----------------
-        bot.ev.on('messages.upsert', async (msgData) => {
+        // ------------------ Message Handling ------------------
+        bot.ev.on('messages.upsert', async (m) => {
+            const msg = m.messages[0]
+            if (!msg.message || msg.key.remoteJid === 'status@broadcast') return
+
+            const from = msg.key.remoteJid
+            
+            let parsed
             try {
-                const msg = msgData.messages[0]
-                if (!msg.message) return
+                parsed = smsg(bot, msg, store)
+            } catch {
+                return
+            }
 
-                const from = msg.key.remoteJid
+            const text = parsed?.message?.trim() || ""
+            if (!text) return
 
-                if (msg.key.remoteJid === "status@broadcast") return
+            console.log("Message from", from, ":", text)
 
-                const parsed = smsg(bot, msg, store)
-                let text = parsed.message?.trim() || ""
+            // ------------- STEP 1: Check if number is known -------------
+            let { data: users } = await supabase
+                .from("users")
+                .select("*")
+                .eq("phone", from)
 
-                console.log("User:", from, "Said:", text)
+            let user = users?.[0]
 
-                // ---------------------------------------
-                //  STEP 1 — ASK FOR EMAIL FIRST
-                // ---------------------------------------
+            if (!user) {
+                await sendWhatsApp(bot, from,
+`Hello 👋  
+Before we continue, please enter your **account email** registered on the website.`)
+                return
+            }
 
-                let savedEmail = emailSession.get(from)
+            // ------------- STEP 2: If user has no email, treat next message as email -------------
+            if (!user.email_verified) {
+                const email = text.toLowerCase().trim()
 
-                if (!savedEmail) {
-                    if (!text.includes("@")) {
-                        await sendWhatsApp(bot, from,
-`👋 Hello! Before we continue, please enter your *email address*.
-
-This lets me connect to your account on the website.`)
-                        return
-                    }
-
-                    // user sent email — verify from DB
-                    const { data: users, error } = await supabase
-                        .from("users")
-                        .select("*")
-                        .eq("email", text.toLowerCase())
-
-                    if (error) {
-                        await sendWhatsApp(bot, from, "⚠️ Server error. Try again later.")
-                        return
-                    }
-
-                    if (!users || users.length === 0) {
-                        await sendWhatsApp(bot, from,
-`❌ That email is not registered.
-
-Please use the email you used on the website.`)
-                        return
-                    }
-
-                    const user = users[0]
-                    emailSession.set(from, user.email)
-
-                    await sendWhatsApp(bot, from,
-`✅ Your account is verified!
-
-How can I assist you today?  
-You can ask things like:
-
-• "deposit 1000"  
-• "withdraw 500"  
-• "invest 2000 silver"  
-• "show my balance"  
-• or *ask anything* — I am powered by AI 🤖`)
-                    return
-                }
-
-                // ---------------------------------------
-                //  STEP 2 — EMAIL VERIFIED → LOAD USER
-                // ---------------------------------------
-
-                const email = savedEmail
-                const { data: users } = await supabase
+                const { data: match } = await supabase
                     .from("users")
                     .select("*")
                     .eq("email", email)
+                    .single()
 
-                const user = users?.[0]
-                if (!user) {
-                    emailSession.del(from)
-                    await sendWhatsApp(bot, from, "❌ Session expired. Please send your email again.")
+                if (!match) {
+                    await sendWhatsApp(bot, from,
+`❌ The email **${email}** was not found in our system.  
+Please enter a valid registered email.`)
                     return
                 }
 
-                // load plans + investments
-                const { data: plans } = await supabase.from("plans").select("*")
-                const { data: investments } = await supabase
-                    .from("investments")
-                    .select("*")
-                    .eq("user_id", user.id)
-                    .eq("active", true)
+                await supabase.from("users")
+                    .update({ email_verified: true, email })
+                    .eq("id", match.id)
 
-                let reply = ""
+                await sendWhatsApp(bot, from,
+`✅ Email verified successfully!  
+You can now ask anything — investments, balance, account info, website details, etc.`)
 
-                // ---------------------------------------
-                //          DEPOSIT LOGIC
-                // ---------------------------------------
-                const dep = text.match(/deposit (\d+)/i)
-                if (dep) {
-                    const amount = parseFloat(dep[1])
-                    const newBal = user.balance + amount
+                user = match
+                return
+            }
 
-                    await supabase.from("users")
-                        .update({ balance: newBal })
-                        .eq("id", user.id)
 
-                    user.balance = newBal
+            // ------------- Step 3: DEPOSIT -------------
+            if (/^deposit \d+$/i.test(text)) {
+                const amount = Number(text.split(" ")[1])
+                const newBalance = user.balance + amount
 
-                    await supabase.from("transactions").insert([{
-                        user_id: user.id,
-                        type: "deposit",
-                        amount,
-                        status: "approved",
-                        created_at: dayjs().format()
-                    }])
+                await supabase.from("users")
+                    .update({ balance: newBalance })
+                    .eq("id", user.id)
 
-                    reply = `💰 Deposit of ${amount} confirmed.\nYour new balance is *${newBal}*.`
+                await sendWhatsApp(bot, from,
+`💰 Deposit successful!  
+Amount: **${amount}**  
+New Balance: **${newBalance}**`)
+                return
+            }
+
+            // ------------- Step 4: WITHDRAW -------------
+            if (/^withdraw \d+$/i.test(text)) {
+                const amount = Number(text.split(" ")[1])
+
+                if (amount > user.balance) {
+                    await sendWhatsApp(bot, from, "❌ Insufficient balance.")
+                    return
                 }
 
-                // ---------------------------------------
-                //          WITHDRAW LOGIC
-                // ---------------------------------------
-                const wd = text.match(/withdraw (\d+)/i)
-                if (wd) {
-                    const amount = parseFloat(wd[1])
-                    if (amount > user.balance) {
-                        reply = "⚠️ You do not have enough balance."
-                    } else {
-                        const newBal = user.balance - amount
+                const newBalance = user.balance - amount
 
-                        await supabase.from("users")
-                            .update({ balance: newBal })
-                            .eq("id", user.id)
+                await supabase.from("users")
+                    .update({ balance: newBalance })
+                    .eq("id", user.id)
 
-                        user.balance = newBal
+                await sendWhatsApp(bot, from,
+`💵 Withdrawal processed!  
+Amount: **${amount}**  
+New Balance: **${newBalance}**`)
+                return
+            }
 
-                        await supabase.from("transactions").insert([{
-                            user_id: user.id,
-                            type: "withdraw",
-                            amount,
-                            status: "approved",
-                            created_at: dayjs().format()
-                        }])
 
-                        reply = `💸 Withdrawal of ${amount} completed.\nNew balance: *${newBal}*.`
-                    }
-                }
+            // ------------- Step 5: GPT ASSISTANT for everything else -------------
+            const prompt = `
+You are the official assistant of Zent Finance.
 
-                // ---------------------------------------
-                //          INVEST LOGIC
-                // ---------------------------------------
-                const inv = text.match(/invest (\d+) (\w+)/i)
-                if (inv) {
-                    const amount = parseFloat(inv[1])
-                    const planName = inv[2].toLowerCase()
+User message:
+"${text}"
 
-                    const plan = plans.find(p => p.name.toLowerCase() === planName)
-
-                    if (!plan) reply = `❌ Plan '${planName}' not found.`
-                    else if (amount < plan.min_investment)
-                        reply = `Minimum for ${plan.name} is ${plan.min_investment}.`
-                    else if (amount > user.balance)
-                        reply = `You don't have enough balance.`
-                    else {
-                        const start = dayjs()
-                        const end = start.add(plan.duration_days, "day")
-
-                        await supabase.from("investments").insert([{
-                            user_id: user.id,
-                            plan_id: plan.id,
-                            amount,
-                            start_date: start.format("YYYY-MM-DD"),
-                            end_date: end.format("YYYY-MM-DD"),
-                            last_calculated: start.format("YYYY-MM-DD"),
-                            active: true
-                        }])
-
-                        await supabase.from("users")
-                            .update({ balance: user.balance - amount })
-                            .eq("id", user.id)
-
-                        user.balance -= amount
-
-                        reply = 
-`📈 You invested *${amount}* in *${plan.name}*!
-Your plan ends: ${end.format("YYYY-MM-DD")}`
-                    }
-                }
-
-                // ---------------------------------------
-                //          GPT ANSWER SYSTEM
-                // ---------------------------------------
-                if (!reply) {
-                    let siteContent = ""
-                    try {
-                        siteContent = (await axios.get(WEBSITE_URL)).data.slice(0, 3000)
-                    } catch {}
-
-                    const prompt = `
-You are the official AI assistant for the website.
-User email: ${user.email}
-User balance: ${user.balance}
-User investments: ${JSON.stringify(investments)}
-User message: "${text}"
+User profile:
+${JSON.stringify(user)}
 
 Website content:
-${siteContent}
+${websiteCache}
 
-Respond clearly and helpfully.
-                    `
+Respond as a friendly finance customer support assistant.
+Be helpful, factual, and direct.
+            `
 
-                    const gpt = await openai.chat.completions.create({
-                        model: "gpt-4o-mini",
-                        messages: [{ role: "user", content: prompt }],
-                        max_tokens: 500
-                    })
+            const ai = await openai.chat.completions.create({
+                model: "gpt-4o-mini",
+                messages: [{ role: "user", content: prompt }],
+                max_tokens: 500
+            })
 
-                    reply = gpt.choices[0].message.content
-                }
-
-                await sendWhatsApp(bot, from, reply)
-
-            } catch (err) {
-                console.log("Message Error:", err)
-            }
+            const answer = ai.choices[0].message.content
+            await sendWhatsApp(bot, from, answer)
         })
 
-        // CONNECTION EVENTS
-        bot.ev.on('connection.update', (update) => {
-            if (update.qr) console.log("📌 Scan the QR code to login.")
-            if (update.connection === "open") console.log("✅ Bot Connected!")
+
+        // ------------------ Connection Handling ------------------
+        bot.ev.on("connection.update", async (update) => {
+            if (update.connection === "open") console.log("✅ WhatsApp Connected.")
+            if (update.qr) console.log("📌 Scan QR Code to Login")
             if (update.connection === "close") {
-                console.log("❌ Disconnected. Restarting…")
-                process.exit(0) // PM2/nodemon restarts automatically
+                console.log("❌ Connection closed. Restarting...")
+                process.exit(0)
             }
         })
 
     } catch (err) {
-        console.error("Fatal Error:", err)
+        console.log("Fatal bot error:", err)
         process.exit(1)
     }
 }
